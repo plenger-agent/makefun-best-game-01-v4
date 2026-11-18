@@ -1,59 +1,94 @@
-// HELIODROME: Bend the Noon — the hand-in program for make.fun's
-// best-game-01 bounty (Node 22, standard library only).
+// HELIODROME — delivery program for our best-game-01 entry.
 //
-// The game itself is the game/ folder beside this file: plain static
-// files (an index.html and its ES modules, no library, no network) that
-// a desktop browser plays offline. This program's one job is to hand
-// that folder in exactly as the scorer expects: copy game/ and
-// screenshots/ into the output directory, then write dossier.json with
-// the vendored make.fun library, so the dossier on disk is byte for
-// byte the dossier the gate rebuilds from the same files.
-//
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for
-// /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// Play the game locally with:  node serve.ts   (then http://localhost:8080)
+// Running this file packs the entry into the folder the grader reads:
+// the playable game and its screenshots are mirrored across, then the
+// dossier describing them is generated and dropped alongside. The
+// destination comes from MAKEFUN_OUTPUT_DIR when the platform sets it
+// and falls back to /output for a plain local run.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-game.ts';
+import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as funLib from "./vendor/makefun-game.ts";
 
-const repoRoot = fileURLToPath(new URL('.', import.meta.url));
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const plan = {
+  banner: "HELIODROME",
+  envKey: "MAKEFUN_OUTPUT_DIR",
+  fallbackDir: "/output",
+  payloads: [
+    { folder: "game", label: "game files" },
+    { folder: "screenshots", label: "screenshots" },
+  ],
+  // The bounty's gate limits, spelled as arithmetic so the magnitudes
+  // stay obvious: a 160 KiB text budget, four shots of 256 KiB at most,
+  // 993 game entries under 48 MiB, no path longer than 1000 bytes.
+  gate: {
+    text_max_bytes: 160 * 1024,
+    screenshots: { max: 4, max_bytes: 256 * 1024 },
+    game_max_files: 993,
+    game_max_bytes: 48 * 1024 * 1024,
+    game_path_max_bytes: 1000,
+  },
+};
 
-// The game goes across exactly as it sits in the repository — the same
-// files a player would be served — and the screenshots beside it.
-mkdirSync(outputDir, { recursive: true });
-cpSync(join(repoRoot, 'game'), join(outputDir, 'game'), { recursive: true });
-mkdirSync(join(outputDir, 'screenshots'), { recursive: true });
-if (existsSync(join(repoRoot, 'screenshots'))) {
-  cpSync(join(repoRoot, 'screenshots'), join(outputDir, 'screenshots'), { recursive: true });
-}
+const repoRoot = fileURLToPath(new URL(".", import.meta.url));
 
-// The dossier: one JSON summary of the whole entry — file tree, source
-// outline, screenshot metadata — built by the vendored library under
-// the scorer's caps.
-const dossierJson = buildDossier(outputDir, {
-  text_max_bytes: 163840,
-  screenshots: { max: 4, max_bytes: 262144 },
-  game_max_files: 993,
-  game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
-});
-writeFileSync(join(outputDir, 'dossier.json'), dossierJson);
-
-// A receipt for whoever runs this by hand — the grader ignores stdout,
-// humans don't: what was handed in, counted back from the output tree
-// itself, so the numbers can never drift from what is actually there.
-function countFiles(dir) {
-  let total = 0;
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) total += countFiles(join(dir, entry.name));
-    else if (entry.isFile()) total += 1;
+// Mirror one directory tree into place, counting the files carried
+// over so the receipt can say how much was delivered.
+function mirrorTree(sourceDir: string, targetDir: string): number {
+  mkdirSync(targetDir, { recursive: true });
+  let carried = 0;
+  const names = readdirSync(sourceDir).sort();
+  for (const name of names) {
+    const from = join(sourceDir, name);
+    const to = join(targetDir, name);
+    if (statSync(from).isDirectory()) {
+      carried += mirrorTree(from, to);
+    } else {
+      copyFileSync(from, to);
+      carried += 1;
+    }
   }
-  return total;
+  return carried;
 }
-const gameFiles = countFiles(join(outputDir, 'game'));
-const shotFiles = countFiles(join(outputDir, 'screenshots'));
-console.log(`HELIODROME handed in: ${gameFiles} game files, ${shotFiles} screenshots, dossier of ${dossierJson.byteLength} bytes.`);
+
+// A game with no front page is not a game at all; refuse to pack one
+// rather than hand the grader a broken entry.
+function checkPlayable(): void {
+  const frontPage = join(repoRoot, "game", "index.html");
+  let isFile = false;
+  try {
+    isFile = statSync(frontPage).isFile();
+  } catch {
+    isFile = false;
+  }
+  if (!isFile) throw new Error("game/index.html is missing, so there is nothing playable to pack");
+}
+
+function packEntry(): string {
+  checkPlayable();
+  const outbox = process.env[plan.envKey] ?? plan.fallbackDir;
+  mkdirSync(outbox, { recursive: true });
+
+  const manifest: string[] = [];
+  for (const item of plan.payloads) {
+    const destination = join(outbox, item.folder);
+    // A stale copy from an earlier pack must never leak into this one.
+    rmSync(destination, { recursive: true, force: true });
+    const count = mirrorTree(join(repoRoot, item.folder), destination);
+    manifest.push(count + " " + item.label);
+  }
+
+  const dossier = funLib.buildDossier(outbox, plan.gate);
+  writeFileSync(join(outbox, "dossier.json"), dossier);
+
+  return plan.banner + " packed for judging: " + manifest.join(" and ") +
+    " delivered; dossier.json runs to " + dossier.length + " bytes.";
+}
+
+try {
+  console.log(packEntry());
+} catch (problem) {
+  console.error("hand-in failed:", problem);
+  process.exitCode = 1;
+}
